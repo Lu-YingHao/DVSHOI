@@ -14,13 +14,14 @@ import torch
 import random
 import warnings
 import argparse
+from datetime import timedelta
 import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler
 
 from upt import build_detector
-from utils import custom_collate, CustomisedDLE, DataFactory
+from utils import custom_collate, CustomisedDLE, DataFactory, validate_training_checkpoint
 
 warnings.filterwarnings("ignore")
 
@@ -30,7 +31,8 @@ def main(rank, args):
         backend="nccl",
         init_method="env://",
         world_size=args.world_size,
-        rank=rank
+        rank=rank,
+        timeout=timedelta(minutes=args.distributed_timeout_minutes)
     )
 
     # Fix seed
@@ -88,7 +90,7 @@ def main(rank, args):
     upt = build_detector(args, object_to_target)
 
     if os.path.exists(args.resume):
-        print(f"=> Rank {rank}: continue from saved checkpoint {args.resume}")
+        print(f"=> Rank {rank}: load model from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
         upt.load_state_dict(checkpoint['model_state_dict'])
     else:
@@ -100,7 +102,11 @@ def main(rank, args):
         num_classes=args.num_classes,
         print_interval=args.print_interval,
         find_unused_parameters=True,
-        cache_dir=args.output_dir
+        cache_dir=args.output_dir,
+        inference_loader=test_loader if args.eval_last_epochs else None,
+        eval_last_epochs=args.eval_last_epochs,
+        vcoco_eval_root=args.vcoco_eval_root,
+        vcoco_exclude_actions=args.vcoco_exclude_actions,
     )
 
     if args.cache:
@@ -112,7 +118,15 @@ def main(rank, args):
 
     if args.eval:
         if args.dataset == 'vcoco':
-            raise NotImplementedError(f"Evaluation on V-COCO has not been implemented.")
+            if rank == 0:
+                from vcoco.evaluation import evaluate_vcoco_cache, load_evaluator
+                engine.cache_vcoco(test_loader, args.output_dir, net=engine._state.net.module)
+                evaluator = load_evaluator(
+                    args.vcoco_eval_root, args.partitions[1], args.vcoco_exclude_actions)
+                metrics = evaluate_vcoco_cache(
+                    evaluator, os.path.join(args.output_dir, 'cache.pkl'))
+                print('[V-COCO METRICS]', metrics)
+            return
         ap = engine.test_hico(test_loader)
         # Fetch indices for rare and non-rare classes
         num_anno = torch.as_tensor(trainset.dataset.anno_interaction)
@@ -138,6 +152,9 @@ def main(rank, args):
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
     # Override optimiser and learning rate scheduler
     engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
+
+    if args.resume_training:
+        engine.restore_training_state(checkpoint, args.epochs)
 
     engine(args.epochs)
 
@@ -242,11 +259,23 @@ if __name__ == '__main__':
     parser.add_argument('--seed', default=66, type=int)
     parser.add_argument('--pretrained', default='', help='Path to a pretrained detector')
     parser.add_argument('--resume', default='', help='Resume from a model')
+    parser.add_argument('--resume-training', action='store_true',
+                        help='Restore optimizer, scheduler and counters; --epochs is the final epoch')
     parser.add_argument('--output-dir', default='checkpoints')
     parser.add_argument('--print-interval', default=500, type=int)
     parser.add_argument('--world-size', default=1, type=int)
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--cache', action='store_true')
+    parser.add_argument('--eval-last-epochs', default=0, type=int,
+                        help='Synchronously evaluate the final N V-COCO training epochs')
+    parser.add_argument('--vcoco-eval-root', default=None,
+                        help='External s-gupta/v-coco tools and official annotations')
+    parser.add_argument('--vcoco-exclude-actions', nargs='*', default=['point'],
+                        help='Explicit evaluation exclusions; pass no values for all actions')
+    parser.add_argument('--distributed-timeout-minutes', default=180, type=int,
+                        help='Collective timeout, including rank-zero synchronous inference')
+    parser.add_argument('--check-only', action='store_true',
+                        help='Check dataset pairing and evaluation resources without training')
     parser.add_argument('--sanity', action='store_true')
     parser.add_argument('--box-score-thresh', default=0.2, type=float)
     parser.add_argument('--fg-iou-thresh', default=0.5, type=float)
@@ -254,7 +283,64 @@ if __name__ == '__main__':
     parser.add_argument('--max-instances', default=15, type=int)
 
     args = parser.parse_args()
+    if args.epochs < 1 or args.eval_last_epochs < 0:
+        parser.error('--epochs must be positive and --eval-last-epochs nonnegative')
+    if len(args.partitions) != 2:
+        parser.error('--partitions requires a training split and an inference split')
+    if args.eval_last_epochs and args.dataset != 'vcoco':
+        parser.error('--eval-last-epochs currently supports --dataset vcoco')
+    if args.distributed_timeout_minutes <= 0:
+        parser.error('--distributed-timeout-minutes must be positive')
+    if args.resume_training:
+        if not os.path.isfile(args.resume):
+            parser.error('--resume-training requires an existing --resume checkpoint')
+        if args.eval or args.cache or args.sanity:
+            parser.error('--resume-training is only for training or --check-only')
+    if args.dataset == 'vcoco' and (args.eval or args.cache) and not os.path.isfile(args.resume):
+        parser.error('V-COCO --eval/--cache requires an existing --resume checkpoint')
     print(args)
+
+    if args.dataset == 'vcoco' and (args.eval_last_epochs or args.eval or args.check_only):
+        from vcoco.evaluation import load_evaluator, resolve_evaluation_root
+        args.vcoco_eval_root = resolve_evaluation_root(args.vcoco_eval_root)
+        # Fail before a long training job if external annotations/tools are missing.
+        load_evaluator(args.vcoco_eval_root, args.partitions[1], args.vcoco_exclude_actions)
+
+    if args.check_only:
+        start_epoch = 0
+        if args.resume_training:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            start_epoch = validate_training_checkpoint(checkpoint, args.epochs)
+        for split in args.partitions:
+            dataset = DataFactory(
+                args.dataset, split, args.data_root,
+                dvs_root=resolve_dvs_root(args),
+                dvs_sensor_size=tuple(args.dvs_sensor_size), dvs_num_bins=args.dvs_num_bins)
+            if args.resume_training and split == args.partitions[0]:
+                iterations = (len(dataset) + args.world_size - 1) // args.world_size // args.batch_size
+                validate_training_checkpoint(checkpoint, args.epochs, iterations)
+            for index in range(len(dataset)):
+                filename = dataset.dataset.filename(index)
+                rgb_path = os.path.join(dataset.dataset._root, filename)
+                if not os.path.isfile(rgb_path):
+                    raise FileNotFoundError('Missing RGB image: ' + rgb_path)
+                if args.use_dvs and not os.path.isfile(dataset._dvs_path(index)):
+                    raise FileNotFoundError('Missing DVS events: ' + dataset._dvs_path(index))
+            image, target = dataset[0]
+            print('[CHECK] split={} samples={} rgb_shape={} dvs_shape={}'.format(
+                split, len(dataset), tuple(image.shape),
+                tuple(target['dvs_frames'].shape) if args.use_dvs else None))
+        if args.pretrained and not os.path.isfile(args.pretrained):
+            raise FileNotFoundError('Missing pretrained detector: ' + args.pretrained)
+        print('[CHECK] CUDA available={}, GPU count={}'.format(
+            torch.cuda.is_available(), torch.cuda.device_count()))
+        if args.resume_training:
+            print('[CHECK] resume epoch {} -> {}; optimizer and scheduler will be restored'.format(
+                start_epoch, args.epochs))
+        if args.eval_last_epochs:
+            print('[CHECK] synchronous inference epochs: {} through {}'.format(
+                max(start_epoch + 1, args.epochs - args.eval_last_epochs + 1), args.epochs))
+        sys.exit()
 
     if args.sanity:
         sanity_check(args)

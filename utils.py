@@ -8,7 +8,15 @@ Australian Centre for Robotic Vision
 """
 
 import os
+import contextlib
+import csv
+import json
+import random
+import sys
+import time
+import traceback
 import torch
+import torch.distributed as dist
 import pickle
 import numpy as np
 import scipy.io as sio
@@ -24,7 +32,6 @@ import pocket.pocket as pocket
 from pocket.pocket.core import DistributedLearningEngine
 from pocket.pocket.utils import DetectionAPMeter, BoxPairAssociation
 
-import sys
 sys.path.append('detr')
 import datasets.transforms as T
 from dvs_data import events_to_frames, load_event_npz
@@ -187,11 +194,160 @@ class CacheTemplate(defaultdict):
         else:
             return [0., 0., .1, .1, 0.]
 
+def validate_training_checkpoint(checkpoint, total_epochs, iterations_per_epoch=None):
+    required = ('epoch', 'iteration', 'model_state_dict',
+                'optim_state_dict', 'scheduler_state_dict')
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise ValueError('Training checkpoint is missing: ' + ', '.join(missing))
+    epoch, iteration = checkpoint['epoch'], checkpoint['iteration']
+    if not isinstance(epoch, int) or epoch < 0 or epoch >= total_epochs:
+        raise ValueError('Target --epochs must exceed the saved epoch ({})'.format(epoch))
+    if not isinstance(iteration, int) or iteration < 0:
+        raise ValueError('Invalid checkpoint iteration')
+    if iterations_per_epoch is not None and iteration != epoch * iterations_per_epoch:
+        raise ValueError('Resume requires the same training split, batch size and world size; '
+                         'saved iteration={} but expected {}'.format(
+                             iteration, epoch * iterations_per_epoch))
+    if checkpoint['scheduler_state_dict'].get('last_epoch') not in (epoch - 1, epoch):
+        raise ValueError('Checkpoint scheduler epoch does not match the training epoch')
+    return epoch
+
+
 class CustomisedDLE(DistributedLearningEngine):
-    def __init__(self, net, dataloader, max_norm=0, num_classes=117, **kwargs):
+    def __init__(self, net, dataloader, max_norm=0, num_classes=117,
+                 inference_loader=None, eval_last_epochs=0,
+                 vcoco_eval_root=None, vcoco_exclude_actions=('point',), **kwargs):
         super().__init__(net, None, dataloader, **kwargs)
         self.max_norm = max_norm
         self.num_classes = num_classes
+        self.inference_loader = inference_loader
+        self.eval_last_epochs = eval_last_epochs
+        self.vcoco_eval_root = vcoco_eval_root
+        self.vcoco_exclude_actions = tuple(vcoco_exclude_actions)
+        self._vcoco_evaluator = None
+
+    def restore_training_state(self, checkpoint, total_epochs):
+        epoch = validate_training_checkpoint(
+            checkpoint, total_epochs, len(self._train_loader))
+        self._state.optimizer.load_state_dict(checkpoint['optim_state_dict'])
+        for parameter, state in self._state.optimizer.state.items():
+            self._state.optimizer.state[parameter] = self._move_to_device(state)
+        self._state.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # Pocket saves the checkpoint BEFORE stepping the epoch scheduler.
+        # Replay that pending step, including at a learning-rate drop boundary.
+        if self._state.lr_scheduler.last_epoch == epoch - 1:
+            self._state.lr_scheduler.step()
+        if 'scaler_state_dict' in checkpoint:
+            self._state.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        self._state.epoch = epoch
+        self._state.iteration = checkpoint['iteration']
+        if self._rank == 0:
+            print('[RESUME] completed_epoch={} next_epoch={} target_epoch={} lr={}'.format(
+                epoch, epoch + 1, total_epochs,
+                [group['lr'] for group in self._state.optimizer.param_groups]))
+
+    def __call__(self, n):
+        # Treat n as the final epoch, preserving cumulative checkpoint numbering
+        # and the final-N evaluation schedule when resuming an earlier run.
+        if self._state.epoch >= n:
+            raise ValueError('Target epochs must exceed the completed epoch')
+        self.epochs = n
+        self._on_start()
+        for _ in range(self._state.epoch, n):
+            self._on_start_epoch()
+            timestamp = time.time()
+            for batch in self._train_loader:
+                self._state.inputs = batch[:-1]
+                self._state.targets = batch[-1]
+                self._on_start_iteration()
+                self._state.t_data.append(time.time() - timestamp)
+                self._on_each_iteration()
+                self._state.running_loss.append(self._state.loss.item())
+                self._on_end_iteration()
+                self._state.t_iteration.append(time.time() - timestamp)
+                timestamp = time.time()
+            self._on_end_epoch()
+        self._on_end()
+
+    def _on_end_epoch(self):
+        # Preserve the existing checkpoint and learning-rate lifecycle.
+        super()._on_end_epoch()
+        first_eval_epoch = max(1, self.epochs - self.eval_last_epochs + 1)
+        if (self.inference_loader is not None and self.eval_last_epochs > 0
+                and self._state.epoch >= first_eval_epoch):
+            self._run_vcoco_epoch_evaluation()
+
+    def _run_vcoco_epoch_evaluation(self):
+        # Only rank zero runs inference. All ranks must wait before the next
+        # training epoch; the unwrapped model avoids DDP forward collectives.
+        dist.barrier()
+        success = torch.ones(1, dtype=torch.int32, device=self._device)
+        error = None
+        if self._rank == 0:
+            try:
+                self._evaluate_vcoco_epoch()
+            except Exception as exc:
+                error = exc
+                success.zero_()
+                traceback.print_exc()
+        dist.broadcast(success, src=0)
+        if not success.item():
+            raise RuntimeError('V-COCO epoch evaluation failed on rank zero') from error
+
+    def _evaluate_vcoco_epoch(self):
+        from vcoco.evaluation import _Tee, evaluate_vcoco_cache, load_evaluator
+
+        epoch = self._state.epoch
+        output_dir = os.path.join(self._cache_dir, 'epoch_{:02d}_eval'.format(epoch))
+        os.makedirs(output_dir, exist_ok=True)
+        checkpoint = os.path.join(
+            self._cache_dir, 'ckpt_{:05d}_{:02d}.pt'.format(self._state.iteration, epoch))
+        if not os.path.isfile(checkpoint):
+            raise FileNotFoundError('Epoch checkpoint was not saved: ' + checkpoint)
+        net = self._state.net.module
+        modes = [(module, module.training) for module in net.modules()]
+        # Evaluation must not perturb the random sequence used by training.
+        rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+               torch.cuda.get_rng_state(self._device))
+        started = time.monotonic()
+        try:
+            with open(os.path.join(output_dir, 'inference.log'), 'w', buffering=1) as log:
+                with contextlib.redirect_stdout(_Tee(sys.stdout, log)), \
+                        contextlib.redirect_stderr(_Tee(sys.stderr, log)):
+                    print('[V-COCO EVAL] epoch={} checkpoint={}'.format(epoch, checkpoint))
+                    print('[V-COCO PROTOCOL] split={} excluded_actions={}'.format(
+                        self.inference_loader.dataset.partition, self.vcoco_exclude_actions))
+                    self.cache_vcoco(self.inference_loader, output_dir, net=net)
+                    if self._vcoco_evaluator is None:
+                        self._vcoco_evaluator = load_evaluator(
+                            self.vcoco_eval_root, self.inference_loader.dataset.partition,
+                            self.vcoco_exclude_actions)
+                    metrics = evaluate_vcoco_cache(
+                        self._vcoco_evaluator, os.path.join(output_dir, 'cache.pkl'))
+                    record = dict(
+                        epoch=epoch, checkpoint=os.path.abspath(checkpoint),
+                        split=self.inference_loader.dataset.partition,
+                        excluded_actions=list(self.vcoco_exclude_actions),
+                        elapsed_seconds=time.monotonic() - started, **metrics)
+                    with open(os.path.join(output_dir, 'metrics.json'), 'w') as file:
+                        json.dump(record, file, indent=2)
+                        file.write('\n')
+                    history_path = os.path.join(self._cache_dir, 'vcoco_metrics.csv')
+                    write_header = not os.path.isfile(history_path)
+                    with open(history_path, 'a', newline='') as file:
+                        writer = csv.DictWriter(file, fieldnames=list(record))
+                        if write_header:
+                            writer.writeheader()
+                        writer.writerow(record)
+                    print('[V-COCO METRICS] ' + json.dumps(record, sort_keys=True))
+        finally:
+            for module, training in modes:
+                module.training = training
+            random.setstate(rng[0])
+            np.random.set_state(rng[1])
+            torch.set_rng_state(rng[2])
+            torch.cuda.set_rng_state(rng[3], self._device)
 
     def _move_to_device(self, x):
         if isinstance(x, torch.Tensor):
@@ -214,8 +370,16 @@ class CustomisedDLE(DistributedLearningEngine):
     def _on_each_iteration(self):
         loss_dict = self._state.net(
             *self._state.inputs, targets=self._state.targets)
-        if loss_dict['interaction_loss'].isnan():
-            raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
+        if not torch.isfinite(loss_dict['interaction_loss']).all():
+            net = getattr(self._state.net, 'module', self._state.net)
+            stats = getattr(net, '_last_hoi_loss_stats', {})
+            filenames = [target.get('file_name', '<unknown>')
+                         for target in self._state.targets]
+            raise ValueError(
+                'The HOI loss is non-finite (NaN/Inf) for rank {}; '
+                'epoch={} iteration={} loss={} stats={} files={}'.format(
+                    self._rank, self._state.epoch, self._state.iteration,
+                    loss_dict['interaction_loss'].detach().item(), stats, filenames))
 
         self._state.loss = sum(loss for loss in loss_dict.values())
         self._state.optimizer.zero_grad(set_to_none=True)
@@ -365,8 +529,8 @@ class CustomisedDLE(DistributedLearningEngine):
             )
 
     @torch.no_grad()
-    def cache_vcoco(self, dataloader, cache_dir='vcoco_cache'):
-        net = self._state.net
+    def cache_vcoco(self, dataloader, cache_dir='vcoco_cache', net=None):
+        net = self._state.net if net is None else net
         net.eval()
 
         dataset = dataloader.dataset.dataset

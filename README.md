@@ -96,9 +96,14 @@ python inference.py --resume checkpoints/upt-r50-hicodet.pt --image-path ./asset
 
 ## Training and Testing
 
+For RGB+DVS V-COCO training with synchronous evaluation of the final four
+epochs, see [the training instructions](docs/vcoco_training.md) and run
+`bash scripts/train_vcoco_dvs.sh`. The default schedule is 20 epochs, with
+inference and Scenario 1/2 role AP evaluation after epochs 17–20.
+
 Refer to [`launch_template.sh`](./launch_template.sh) for training and testing commands with different options. To train the UPT model from scratch, you need to download the weights for the corresponding DETR model, and place them under `/path/to/upt/checkpoints/`. Adjust `--world-size` based on the number of GPUs available.
 
-To test the UPT model on HICO-DET, you can either use the Python utilities we implemented or the Matlab utilities provided by [Chao et al.](https://github.com/ywchao/ho-rcnn). For V-COCO, we did not implement evaluation utilities, and instead use the utilities provided by [Gupta et al.](https://github.com/s-gupta/v-coco#evaluation). Refer to these [instructions](https://github.com/fredzzhang/upt/discussions/14) for more details.
+To test the UPT model on HICO-DET, you can either use the Python utilities we implemented or the Matlab utilities provided by [Chao et al.](https://github.com/ywchao/ho-rcnn). V-COCO evaluation runs the external tools provided by [Gupta et al.](https://github.com/s-gupta/v-coco#evaluation) through [vcoco/evaluation.py](vcoco/evaluation.py), with explicit action exclusions and per-epoch metrics. See [the training instructions](docs/vcoco_training.md) for evaluation and checkpoint resume commands.
 
 ## Citation
 

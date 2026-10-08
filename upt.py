@@ -112,13 +112,22 @@ class UPT(nn.Module):
         x, y = torch.nonzero(prior).unbind(1)
         logits = logits[x, y]; prior = prior[x, y]; labels = labels[x, y]
 
-        n_p = len(torch.nonzero(labels))
+        local_n_p = len(torch.nonzero(labels))
+        n_p = logits.new_tensor(float(local_n_p))
         if dist.is_initialized():
             world_size = dist.get_world_size()
-            n_p = torch.as_tensor([n_p], device='cuda')
-            dist.barrier()
             dist.all_reduce(n_p)
-            n_p = (n_p / world_size).item()
+            n_p = n_p / world_size
+
+        # A batch can contain annotated HOIs yet have no matching proposals.
+        # Keep its negative supervision, but never divide by zero. Clamp after
+        # reduction so all DDP ranks use the same normalisation.
+        n_p = n_p.clamp(min=1)
+        self._last_hoi_loss_stats = dict(
+            matched_positives=local_n_p,
+            valid_pair_actions=labels.numel(),
+            normalizer=n_p.detach(),
+        )
 
         loss = binary_focal_loss_with_logits(
             torch.log(
