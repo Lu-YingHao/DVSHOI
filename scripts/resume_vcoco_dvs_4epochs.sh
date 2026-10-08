@@ -8,19 +8,20 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
 
 PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
-RESUME="${RESUME:-$PROJECT_ROOT/checkpoints/upt-dvs-vcoco-bs4-12epochs-20261007_163525/ckpt_14904_12.pt}"
+RESUME="${RESUME:-}"
+FINAL_EPOCH="${FINAL_EPOCH:-16}"
 run_stamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/checkpoints/upt-dvs-vcoco-bs4-epochs13-16_$run_stamp}"
+OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/checkpoints/upt-dvs-vcoco-query-resume_$run_stamp}"
 
 if [[ ! -f "$RESUME" ]]; then
-    echo "Checkpoint not found: $RESUME" >&2
+    echo "Set RESUME to an existing query-model checkpoint; legacy mean-DVS weights need a new run." >&2
     exit 1
 fi
 mkdir -p "$OUT_DIR"
 
-echo "Resume V-COCO RGB+DVS from epoch 12; train epochs 13-16."
-echo "Single GPU, batch size 4; restore AdamW and StepLR (current LR 1e-5)."
-echo "Evaluate every resumed epoch; exclude point from AP."
+echo "Resume V-COCO RGB+DVS query model to final epoch $FINAL_EPOCH."
+echo "Single GPU, batch size 4; restore AdamW and StepLR from the query checkpoint."
+echo "Evaluate the final four epochs; exclude point from AP."
 echo "Checkpoint: $RESUME"
 echo "Output directory: $OUT_DIR"
 
@@ -31,7 +32,7 @@ echo "Output directory: $OUT_DIR"
     --world-size 1 \
     --batch-size 4 \
     --num-workers "${NUM_WORKERS:-4}" \
-    --epochs 16 \
+    --epochs "$FINAL_EPOCH" \
     --lr-head 1e-4 \
     --lr-drop 10 \
     --gamma 0.2 \

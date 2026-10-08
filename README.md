@@ -1,6 +1,6 @@
 # UPT + DVS
 
-This project extends UPT with a DVS event encoder and RGB/event feature fusion for human-object interaction detection. The local DETR, HICO-DET, and V-COCO code is included directly to preserve project modifications. Datasets, model checkpoints, and local environments are excluded. See [the fusion research notes](docs/dvs_rgb_fusion_research_2026-10-01.md) for the current research direction.
+This project extends UPT with a DVS event encoder and pair/action queries over ordered spatiotemporal event tokens for human-object interaction detection. The temporal-mean DVS fusion has been replaced; see [the query design](docs/dvs_query_fusion.md) and [training instructions](docs/vcoco_training.md), including initialization from legacy checkpoints. The local DETR, HICO-DET, and V-COCO code is included directly to preserve project modifications. Datasets, model checkpoints, and local environments are excluded.
 
 The upstream UPT documentation and attribution follow.
 

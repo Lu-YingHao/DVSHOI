@@ -295,7 +295,11 @@ def build_detector(args, class_corr):
         detr.backbone[0].num_channels,
         args.num_classes, args.human_idx, class_corr,
         use_dvs=getattr(args, 'use_dvs', False),
-        dvs_variant=getattr(args, 'dvs_variant', 'base')
+        dvs_variant=getattr(args, 'dvs_variant', 'base'),
+        dvs_query_dim=getattr(args, 'dvs_query_dim', 128),
+        dvs_query_heads=getattr(args, 'dvs_query_heads', 4),
+        dvs_query_chunk_size=getattr(args, 'dvs_query_chunk_size', 16),
+        dvs_query_grid=tuple(getattr(args, 'dvs_query_grid', (4, 6))),
     )
     detector = UPT(
         detr, postprocessors['bbox'], interaction_head,

@@ -45,7 +45,7 @@ class TestDVSSpikformer(unittest.TestCase):
         )
         frames = (torch.rand(2, 4, 2, 32, 48) > 0.5).float()
         features = model(frames)
-        self.assertEqual(tuple(features.shape), (2, 4, 32))
+        self.assertEqual(tuple(features.shape), (2, 4, 32, 2, 3))
         self.assertTrue(torch.isfinite(features).all().item())
         features.sum().backward()
         first_conv = model.patch_embed.stages[0].conv
@@ -77,7 +77,7 @@ class TestDVSSpikformer(unittest.TestCase):
         model.eval()
         with torch.no_grad():
             features = model(torch.zeros(1, 2, 2, 32, 48))
-        self.assertEqual(tuple(features.shape), (1, 2, 256))
+        self.assertEqual(tuple(features.shape), (1, 2, 256, 2, 3))
 
 
 if __name__ == '__main__':

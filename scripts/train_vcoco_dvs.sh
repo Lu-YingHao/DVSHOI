@@ -18,11 +18,11 @@ DVS_ROOT="${DVS_ROOT:-$HOME/Data/vcoco-dvs}"
 VCOCO_EVAL_ROOT="${VCOCO_EVAL_ROOT:-$PROJECT_ROOT/vcoco/v_coco}"
 PRETRAINED="${PRETRAINED:-$PROJECT_ROOT/checkpoints/detr/detr-r50-vcoco.pth}"
 run_stamp="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/checkpoints/upt-dvs-r50-vcoco-mean_$run_stamp}"
+OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/checkpoints/upt-dvs-r50-vcoco-query_$run_stamp}"
 LOG_FILE="${LOG_FILE:-$OUT_DIR/train.log}"
 mkdir -p "$OUT_DIR" "$(dirname "$LOG_FILE")"
 
-echo "V-COCO: trainval -> test, DVS temporal mean + feature residual"
+echo "V-COCO: trainval -> test, DVS pair/action queries over ordered spatiotemporal tokens"
 echo "Epochs: $EPOCHS; synchronous evaluation in the final $EVAL_LAST_EPOCHS epochs"
 echo "Evaluation: IoU=0.5, point excluded (24 role-action classes)"
 echo "Output directory: $OUT_DIR"
@@ -42,6 +42,10 @@ echo "Training log: $LOG_FILE"
     --dvs-root "$DVS_ROOT" \
     --dvs-num-bins 8 \
     --dvs-variant "${DVS_VARIANT:-base}" \
+    --dvs-query-dim 128 \
+    --dvs-query-heads 4 \
+    --dvs-query-grid 4 6 \
+    --dvs-query-chunk-size 16 \
     --pretrained "$PRETRAINED" \
     --output-dir "$OUT_DIR" \
     --eval-last-epochs "$EVAL_LAST_EPOCHS" \

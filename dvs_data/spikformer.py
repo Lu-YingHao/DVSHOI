@@ -183,7 +183,7 @@ class _SpikformerBlock(nn.Module):
 
 
 class DVSSpikformer(nn.Module):
-    """Encode ``[B, T, 2, H, W]`` frames as ``[B, T, D]`` features.
+    """Encode ``[B, T, 2, H, W]`` as ``[B, T, D, H', W']`` features.
 
     ``variant='base'`` is the full six-block model. ``variant='tiny'`` keeps
     the earlier lightweight configuration for ablation experiments. Explicit
@@ -255,7 +255,7 @@ class DVSSpikformer(nn.Module):
         x = x.flatten(start_dim=3)
         for block in self.blocks:
             x = block(x)
-        return x.mean(dim=-1).permute(1, 0, 2).contiguous()
+        return x.reshape(steps, batch, channels, *grid).permute(1, 0, 2, 3, 4).contiguous()
 
     def forward(self, frames):
         return self.forward_features(frames)

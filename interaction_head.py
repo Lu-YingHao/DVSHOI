@@ -17,7 +17,7 @@ from collections import OrderedDict
 import pocket.pocket as pocket
 
 from ops import compute_spatial_encodings
-from dvs_data import DVSSpikformer
+from dvs_data import DVSSpikformer, DVSPairActionQuery
 
 class MultiBranchFusion(nn.Module):
     """
@@ -200,7 +200,9 @@ class InteractionHead(nn.Module):
         hidden_state_size: int, representation_size: int,
         num_channels: int, num_classes: int, human_idx: int,
         object_class_to_target_class: List[list],
-        use_dvs: bool = False, dvs_variant: str = 'base'
+        use_dvs: bool = False, dvs_variant: str = 'base',
+        dvs_query_dim: int = 128, dvs_query_heads: int = 4,
+        dvs_query_chunk_size: int = 16, dvs_query_grid: Tuple[int, int] = (4, 6)
     ) -> None:
         super().__init__()
 
@@ -216,12 +218,11 @@ class InteractionHead(nn.Module):
 
         if self.use_dvs:
             self.dvs_encoder = DVSSpikformer(variant=dvs_variant)
-            self.dvs_norm = nn.LayerNorm(self.dvs_encoder.embed_dim)
-            self.dvs_adapter = nn.Linear(
-                self.dvs_encoder.embed_dim, representation_size * 2
+            self.dvs_query = DVSPairActionQuery(
+                representation_size * 2, self.dvs_encoder.embed_dim, num_classes,
+                query_dim=dvs_query_dim, num_heads=dvs_query_heads,
+                pair_chunk_size=dvs_query_chunk_size, spatial_grid=dvs_query_grid,
             )
-            nn.init.zeros_(self.dvs_adapter.weight)
-            nn.init.zeros_(self.dvs_adapter.bias)
 
         # Map spatial encodings to the same dimension as appearance features
         self.spatial_head = nn.Sequential(
@@ -304,19 +305,18 @@ class InteractionHead(nn.Module):
 
         device = features.device
         global_features = self.avg_pool(features).flatten(start_dim=1)
-        dvs_residual = None
+        dvs_features = None
         if self.use_dvs:
             if dvs_frames is None:
                 raise ValueError("DVS fusion requires dvs_frames")
             if len(dvs_frames) != len(region_props):
                 raise ValueError("DVS batch size does not match RGB batch size")
             dvs_features = self.dvs_encoder(dvs_frames)
-            dvs_context = self.dvs_norm(dvs_features.mean(dim=1))
-            dvs_residual = self.dvs_adapter(dvs_context)
 
         boxes_h_collated = []; boxes_o_collated = []
         prior_collated = []; object_class_collated = []
         pairwise_tokens_collated = []
+        dvs_logits_collated = []
         attn_maps_collated = []
 
         for b_idx, props in enumerate(region_props):
@@ -344,6 +344,9 @@ class InteractionHead(nn.Module):
                 boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
                 object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
                 prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
+                if self.use_dvs:
+                    dvs_logits_collated.append(features.new_empty((0, self.num_classes)))
+                attn_maps_collated.append(([], None))
                 continue
 
             # Get the pairwise indices
@@ -377,10 +380,10 @@ class InteractionHead(nn.Module):
                     global_features[b_idx, None],
                     box_pair_spatial_reshaped[x_keep, y_keep])
             ], dim=1)
-            if dvs_residual is not None:
-                pairwise_tokens = pairwise_tokens + dvs_residual[b_idx, None]
             # Run the competitive layer
             pairwise_tokens, pairwise_attn = self.comp_layer(pairwise_tokens)
+            if self.use_dvs:
+                dvs_logits_collated.append(self.dvs_query(pairwise_tokens, dvs_features[b_idx]))
 
             pairwise_tokens_collated.append(pairwise_tokens)
             boxes_h_collated.append(x_keep)
@@ -394,6 +397,8 @@ class InteractionHead(nn.Module):
 
         pairwise_tokens_collated = torch.cat(pairwise_tokens_collated)
         logits = self.box_pair_predictor(pairwise_tokens_collated)
+        if self.use_dvs:
+            logits = logits + torch.cat(dvs_logits_collated)
 
         return logits, prior_collated, \
             boxes_h_collated, boxes_o_collated, object_class_collated, attn_maps_collated

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from upt import build_detector
 from utils import custom_collate, CustomisedDLE, DataFactory, validate_training_checkpoint
+from dvs_data.checkpoint import load_hoi_weights, is_legacy_dvs_state
 
 warnings.filterwarnings("ignore")
 
@@ -92,7 +93,10 @@ def main(rank, args):
     if os.path.exists(args.resume):
         print(f"=> Rank {rank}: load model from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        upt.load_state_dict(checkpoint['model_state_dict'])
+        removed = load_hoi_weights(upt, checkpoint['model_state_dict'], args.init_legacy_dvs)
+        if removed and rank == 0:
+            print('[INIT] shared RGB layers and DVS encoder loaded; query branch initialized anew; '
+                  'legacy layers discarded: {}'.format(removed))
     else:
         print(f"=> Rank {rank}: start from a randomly initialised model")
 
@@ -251,6 +255,11 @@ if __name__ == '__main__':
     parser.add_argument('--dvs-sensor-size', nargs=2, default=[260, 346], type=int)
     parser.add_argument('--dvs-num-bins', default=8, type=int)
     parser.add_argument('--dvs-variant', default='base', choices=('tiny', 'base'))
+    parser.add_argument('--dvs-query-dim', default=128, type=int)
+    parser.add_argument('--dvs-query-heads', default=4, type=int)
+    parser.add_argument('--dvs-query-chunk-size', default=16, type=int)
+    parser.add_argument('--dvs-query-grid', nargs=2, default=[4, 6], type=int,
+                        help='Spatial token grid per time bin; all time bins are retained')
 
     # training parameters
     parser.add_argument('--device', default='cuda',
@@ -261,6 +270,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default='', help='Resume from a model')
     parser.add_argument('--resume-training', action='store_true',
                         help='Restore optimizer, scheduler and counters; --epochs is the final epoch')
+    parser.add_argument('--init-legacy-dvs', action='store_true',
+                        help='Initialize shared layers from an old mean-DVS model for a NEW query run')
     parser.add_argument('--output-dir', default='checkpoints')
     parser.add_argument('--print-interval', default=500, type=int)
     parser.add_argument('--world-size', default=1, type=int)
@@ -285,6 +296,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.epochs < 1 or args.eval_last_epochs < 0:
         parser.error('--epochs must be positive and --eval-last-epochs nonnegative')
+    if (args.dvs_query_dim < 1 or args.dvs_query_heads < 1
+            or args.dvs_query_dim % args.dvs_query_heads
+            or args.dvs_query_chunk_size < 1 or min(args.dvs_query_grid) < 1):
+        parser.error('Invalid DVS query dimensions, head count, chunk size or spatial grid')
+    if args.init_legacy_dvs and (not args.use_dvs or not os.path.isfile(args.resume)
+                               or args.resume_training or args.eval or args.cache or args.sanity):
+        parser.error('--init-legacy-dvs needs --use-dvs and --resume PATH for a NEW training run')
     if len(args.partitions) != 2:
         parser.error('--partitions requires a training split and an inference split')
     if args.eval_last_epochs and args.dataset != 'vcoco':
@@ -308,8 +326,16 @@ if __name__ == '__main__':
 
     if args.check_only:
         start_epoch = 0
+        if args.init_legacy_dvs:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            if not is_legacy_dvs_state(checkpoint['model_state_dict']):
+                raise ValueError('--init-legacy-dvs requires legacy DVS weights')
+            print('[CHECK] legacy weights will initialize shared layers; query training starts at epoch 1')
         if args.resume_training:
             checkpoint = torch.load(args.resume, map_location='cpu')
+            if is_legacy_dvs_state(checkpoint['model_state_dict']):
+                raise ValueError('Legacy mean-DVS checkpoints cannot resume query training; '
+                                 'use --init-legacy-dvs for a new experiment')
             start_epoch = validate_training_checkpoint(checkpoint, args.epochs)
         for split in args.partitions:
             dataset = DataFactory(
@@ -334,6 +360,9 @@ if __name__ == '__main__':
             raise FileNotFoundError('Missing pretrained detector: ' + args.pretrained)
         print('[CHECK] CUDA available={}, GPU count={}'.format(
             torch.cuda.is_available(), torch.cuda.device_count()))
+        if args.use_dvs:
+            print('[CHECK] DVS pair/action queries: all {} time bins retained, spatial grid={}, dim={}'.format(
+                args.dvs_num_bins, args.dvs_query_grid, args.dvs_query_dim))
         if args.resume_training:
             print('[CHECK] resume epoch {} -> {}; optimizer and scheduler will be restored'.format(
                 start_epoch, args.epochs))
