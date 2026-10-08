@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from upt import build_detector
 from utils import custom_collate, CustomisedDLE, DataFactory, validate_training_checkpoint
-from dvs_data.checkpoint import load_hoi_weights, is_legacy_dvs_state
+from dvs_data.checkpoint import load_hoi_weights, is_legacy_dvs_state, validate_query_layout
 
 warnings.filterwarnings("ignore")
 
@@ -93,10 +93,13 @@ def main(rank, args):
     if os.path.exists(args.resume):
         print(f"=> Rank {rank}: load model from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        removed = load_hoi_weights(upt, checkpoint['model_state_dict'], args.init_legacy_dvs)
-        if removed and rank == 0:
+        changed = load_hoi_weights(upt, checkpoint['model_state_dict'], args.init_legacy_dvs,
+                                   args.init_query_baseline)
+        if args.init_query_baseline and rank == 0:
+            print('[INIT] baseline query weights loaded; new modules initialized: {}'.format(changed))
+        elif changed and rank == 0:
             print('[INIT] shared RGB layers and DVS encoder loaded; query branch initialized anew; '
-                  'legacy layers discarded: {}'.format(removed))
+                  'legacy layers discarded: {}'.format(changed))
     else:
         print(f"=> Rank {rank}: start from a randomly initialised model")
 
@@ -260,6 +263,10 @@ if __name__ == '__main__':
     parser.add_argument('--dvs-query-chunk-size', default=16, type=int)
     parser.add_argument('--dvs-query-grid', nargs=2, default=[4, 6], type=int,
                         help='Spatial token grid per time bin; all time bins are retained')
+    parser.add_argument('--dvs-adjacent-changes', action='store_true',
+                        help='Append endpoint/signed-change tokens for each adjacent time interval')
+    parser.add_argument('--dvs-precomp-residual', action='store_true',
+                        help='Inject a zero-initialized pair event residual before competitive reasoning')
 
     # training parameters
     parser.add_argument('--device', default='cuda',
@@ -272,6 +279,8 @@ if __name__ == '__main__':
                         help='Restore optimizer, scheduler and counters; --epochs is the final epoch')
     parser.add_argument('--init-legacy-dvs', action='store_true',
                         help='Initialize shared layers from an old mean-DVS model for a NEW query run')
+    parser.add_argument('--init-query-baseline', action='store_true',
+                        help='Initialize new DVS modules from a baseline query checkpoint; NEW training run')
     parser.add_argument('--output-dir', default='checkpoints')
     parser.add_argument('--print-interval', default=500, type=int)
     parser.add_argument('--world-size', default=1, type=int)
@@ -303,6 +312,13 @@ if __name__ == '__main__':
     if args.init_legacy_dvs and (not args.use_dvs or not os.path.isfile(args.resume)
                                or args.resume_training or args.eval or args.cache or args.sanity):
         parser.error('--init-legacy-dvs needs --use-dvs and --resume PATH for a NEW training run')
+    if (args.dvs_adjacent_changes or args.dvs_precomp_residual) and not args.use_dvs:
+        parser.error('DVS branch flags require --use-dvs')
+    if args.init_query_baseline and (not args.use_dvs or not os.path.isfile(args.resume)
+                                   or args.init_legacy_dvs or args.resume_training or args.eval
+                                   or args.cache or args.sanity
+                                   or not (args.dvs_adjacent_changes or args.dvs_precomp_residual)):
+        parser.error('--init-query-baseline needs a baseline --resume and new DVS flags for a NEW training run')
     if len(args.partitions) != 2:
         parser.error('--partitions requires a training split and an inference split')
     if args.eval_last_epochs and args.dataset != 'vcoco':
@@ -326,6 +342,12 @@ if __name__ == '__main__':
 
     if args.check_only:
         start_epoch = 0
+        if os.path.isfile(args.resume):
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            validate_query_layout(checkpoint['model_state_dict'], args.dvs_adjacent_changes,
+                                  args.dvs_precomp_residual, args.init_query_baseline)
+        if args.init_query_baseline:
+            print('[CHECK] baseline query initializes shared weights; new experiment starts at epoch 1')
         if args.init_legacy_dvs:
             checkpoint = torch.load(args.resume, map_location='cpu')
             if not is_legacy_dvs_state(checkpoint['model_state_dict']):
@@ -363,6 +385,8 @@ if __name__ == '__main__':
         if args.use_dvs:
             print('[CHECK] DVS pair/action queries: all {} time bins retained, spatial grid={}, dim={}'.format(
                 args.dvs_num_bins, args.dvs_query_grid, args.dvs_query_dim))
+            print('[CHECK] adjacent changes={}, pre-competitive pair residual={}'.format(
+                args.dvs_adjacent_changes, args.dvs_precomp_residual))
         if args.resume_training:
             print('[CHECK] resume epoch {} -> {}; optimizer and scheduler will be restored'.format(
                 start_epoch, args.epochs))

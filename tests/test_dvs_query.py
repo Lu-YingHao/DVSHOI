@@ -4,8 +4,8 @@ import unittest
 import torch
 from torch import nn
 
-from dvs_data.query import DVSPairActionQuery
-from dvs_data.checkpoint import load_hoi_weights
+from dvs_data.query import DVSPairActionQuery, DVSPairRelationQuery
+from dvs_data.checkpoint import load_hoi_weights, query_extension_keys, validate_query_layout
 
 
 class TestDVSQuery(unittest.TestCase):
@@ -107,6 +107,116 @@ class TestLegacyMigration(unittest.TestCase):
         state.pop('interaction_head.dvs_query.score.weight')
         with self.assertRaises(RuntimeError):
             load_hoi_weights(self.model, state)
+
+
+class TestTemporalChanges(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(12)
+        self.model = DVSPairActionQuery(16, 8, 3, query_dim=16, num_heads=4,
+                                       spatial_grid=(2, 3), adjacent_changes=True)
+
+    def test_signed_endpoints_and_magnitude(self):
+        endpoints = torch.tensor([[1., 4.], [3., 1.], [2., 5.]])
+        actual = self.model.adjacent_inputs(endpoints)
+        torch.testing.assert_allclose(actual, torch.tensor([
+            [1., 4., 3., 1., 2., -3., 2., 3.],
+            [3., 1., 2., 5., -1., 4., 1., 4.]]))
+        backward = self.model.adjacent_inputs(endpoints.flip(0))
+        torch.testing.assert_allclose(backward[:, 4:6], -actual.flip(0)[:, 4:6])
+
+    def test_all_bins_and_intervals_retained_with_single_bin_supported(self):
+        for steps in [1, 4]:
+            sequence = torch.randn(steps, 8, 3, 4, requires_grad=True)
+            memory = self.model.prepare_memory(sequence)
+            self.assertEqual(memory.shape, ((2 * steps - 1) * 6, 1, 16))
+            self.assertTrue(torch.isfinite(memory).all().item())
+            memory.square().sum().backward()
+            self.assertGreater(sequence.grad.abs().sum().item(), 0)
+            if steps > 1:
+                self.assertGreater(self.model.change_proj.weight.grad.abs().sum().item(), 0)
+                self.assertGreater(self.model.interval_proj.weight.grad.abs().sum().item(), 0)
+
+    def test_change_evidence_encodes_direction_without_temporal_positions(self):
+        sequence = torch.randn(4, 8, 3, 4)
+        pairs = torch.randn(5, 16)
+        memory = self.model.prepare_memory(sequence)
+        self.model.adjacent_changes = False
+        original = self.model.prepare_memory(sequence)
+        torch.testing.assert_allclose(memory[:len(original)], original, atol=0, rtol=0)
+        self.model.adjacent_changes = True
+        with torch.no_grad():
+            self.model.position_proj.weight[:, 0].zero_()
+            self.model.interval_proj.weight.zero_()
+        # Original tokens alone are invariant to reversing complete time bins
+        # here, but endpoint/difference tokens still encode interval direction.
+        forward = self.model.extract_features(pairs, sequence)
+        backward = self.model.extract_features(pairs, sequence.flip(0))
+        self.assertFalse(torch.allclose(forward, backward, atol=1e-6))
+
+    def test_both_queries_share_memory_and_relation_learns_from_zero(self):
+        pairs = torch.randn(5, 16)
+        sequence = torch.randn(4, 8, 3, 4, requires_grad=True)
+        memory = self.model.prepare_memory(sequence)
+        relation = DVSPairRelationQuery(16, 16, 4, pair_chunk_size=2)
+        residual = relation(pairs, memory)
+        self.assertTrue(torch.equal(residual, torch.zeros_like(pairs)))
+        residual.sum().backward(retain_graph=True)
+        self.assertGreater(relation.residual.weight.grad.abs().sum().item(), 0)
+        with torch.no_grad():
+            relation.residual.weight.normal_(0, .1)
+        relation.zero_grad()
+        nonzero = relation(pairs, memory)
+        nonzero.square().sum().backward()
+        self.assertFalse(torch.allclose(nonzero[0], nonzero[1]))
+        self.assertGreater(relation.pair_proj.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(self.model.change_proj.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(sequence.grad.abs().sum().item(), 0)
+        self.assertEqual(relation(pairs[:0], memory).shape, (0, 16))
+        torch.testing.assert_allclose(self.model(pairs, sequence), self.model(pairs, memory=memory))
+        with self.assertRaises(ValueError):
+            self.model(pairs, sequence, memory=memory)
+
+    def test_relation_chunk_parity(self):
+        pairs = torch.randn(5, 16)
+        memory = self.model.prepare_memory(torch.randn(4, 8, 3, 4))
+        relation = DVSPairRelationQuery(16, 16, 4, 2)
+        with torch.no_grad():
+            relation.residual.weight.normal_(0, .1)
+        full = copy.deepcopy(relation)
+        full.pair_chunk_size = 100
+        torch.testing.assert_allclose(relation(pairs, memory), full(pairs, memory), atol=1e-6, rtol=1e-5)
+
+
+class TestQueryExtensionMigration(unittest.TestCase):
+    def make_model(self, changes, relation):
+        model = nn.Module()
+        head = nn.Module()
+        head.dvs_encoder = nn.Linear(8, 8)
+        head.dvs_query = DVSPairActionQuery(16, 8, 3, query_dim=16, adjacent_changes=changes)
+        if relation:
+            head.dvs_relation_query = DVSPairRelationQuery(16, 16)
+        model.interaction_head = head
+        return model
+
+    def test_each_new_branch_requires_explicit_initialization_then_loads_strictly(self):
+        baseline = self.make_model(False, False).state_dict()
+        for changes, relation in [(True, False), (False, True), (True, True)]:
+            model = self.make_model(changes, relation)
+            with self.assertRaisesRegex(ValueError, 'init-query-baseline'):
+                load_hoi_weights(model, baseline)
+            initialized = load_hoi_weights(model, baseline, init_query_baseline=True)
+            self.assertEqual(set(initialized), query_extension_keys(model.state_dict()))
+            for key, value in baseline.items():
+                self.assertTrue(torch.equal(model.state_dict()[key], value))
+            self.assertEqual(load_hoi_weights(model, model.state_dict()), [])
+            with self.assertRaises(ValueError):
+                load_hoi_weights(model, model.state_dict(), init_query_baseline=True)
+            with self.assertRaises(ValueError):
+                validate_query_layout(model.state_dict(), not changes, relation)
+            broken = dict(baseline)
+            broken.pop('interaction_head.dvs_encoder.weight')
+            with self.assertRaisesRegex(ValueError, 'incompatible shared layers'):
+                load_hoi_weights(model, broken, init_query_baseline=True)
 
 
 if __name__ == '__main__':

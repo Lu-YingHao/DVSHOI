@@ -17,7 +17,7 @@ from collections import OrderedDict
 import pocket.pocket as pocket
 
 from ops import compute_spatial_encodings
-from dvs_data import DVSSpikformer, DVSPairActionQuery
+from dvs_data import DVSSpikformer, DVSPairActionQuery, DVSPairRelationQuery
 
 class MultiBranchFusion(nn.Module):
     """
@@ -202,7 +202,8 @@ class InteractionHead(nn.Module):
         object_class_to_target_class: List[list],
         use_dvs: bool = False, dvs_variant: str = 'base',
         dvs_query_dim: int = 128, dvs_query_heads: int = 4,
-        dvs_query_chunk_size: int = 16, dvs_query_grid: Tuple[int, int] = (4, 6)
+        dvs_query_chunk_size: int = 16, dvs_query_grid: Tuple[int, int] = (4, 6),
+        dvs_adjacent_changes: bool = False, dvs_precomp_residual: bool = False
     ) -> None:
         super().__init__()
 
@@ -215,6 +216,7 @@ class InteractionHead(nn.Module):
         self.human_idx = human_idx
         self.object_class_to_target_class = object_class_to_target_class
         self.use_dvs = use_dvs
+        self.dvs_precomp_residual = dvs_precomp_residual
 
         if self.use_dvs:
             self.dvs_encoder = DVSSpikformer(variant=dvs_variant)
@@ -222,7 +224,12 @@ class InteractionHead(nn.Module):
                 representation_size * 2, self.dvs_encoder.embed_dim, num_classes,
                 query_dim=dvs_query_dim, num_heads=dvs_query_heads,
                 pair_chunk_size=dvs_query_chunk_size, spatial_grid=dvs_query_grid,
+                adjacent_changes=dvs_adjacent_changes,
             )
+            if dvs_precomp_residual:
+                self.dvs_relation_query = DVSPairRelationQuery(
+                    representation_size * 2, dvs_query_dim, dvs_query_heads,
+                    dvs_query_chunk_size)
 
         # Map spatial encodings to the same dimension as appearance features
         self.spatial_head = nn.Sequential(
@@ -381,9 +388,15 @@ class InteractionHead(nn.Module):
                     box_pair_spatial_reshaped[x_keep, y_keep])
             ], dim=1)
             # Run the competitive layer
+            memory = None
+            if self.use_dvs:
+                # Both branches read the same complete temporal memory, built once.
+                memory = self.dvs_query.prepare_memory(dvs_features[b_idx])
+                if self.dvs_precomp_residual:
+                    pairwise_tokens = pairwise_tokens + self.dvs_relation_query(pairwise_tokens, memory)
             pairwise_tokens, pairwise_attn = self.comp_layer(pairwise_tokens)
             if self.use_dvs:
-                dvs_logits_collated.append(self.dvs_query(pairwise_tokens, dvs_features[b_idx]))
+                dvs_logits_collated.append(self.dvs_query(pairwise_tokens, memory=memory))
 
             pairwise_tokens_collated.append(pairwise_tokens)
             boxes_h_collated.append(x_keep)

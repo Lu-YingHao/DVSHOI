@@ -300,6 +300,8 @@ def build_detector(args, class_corr):
         dvs_query_heads=getattr(args, 'dvs_query_heads', 4),
         dvs_query_chunk_size=getattr(args, 'dvs_query_chunk_size', 16),
         dvs_query_grid=tuple(getattr(args, 'dvs_query_grid', (4, 6))),
+        dvs_adjacent_changes=getattr(args, 'dvs_adjacent_changes', False),
+        dvs_precomp_residual=getattr(args, 'dvs_precomp_residual', False),
     )
     detector = UPT(
         detr, postprocessors['bbox'], interaction_head,
