@@ -19,6 +19,8 @@ logits[p,a] = RGB_logits[p,a] + Linear(d[p,a])
 
 ## 可选改进：相邻变化与关系推理前残差
 
+2026-10-09更新：关系分支默认改为由RGB实例内容初始化、在DVS各时间bin中竞争并传播状态的主体槽，避免依赖RGB–DVS框坐标对齐。下面的单次全图pair关系query可通过`--dvs-relation-mode global`复现旧实验；新默认方案、论文出处与可论证边界见[主体时序读取](dvs_entity_slots.md)。相邻变化token和动作query的定义保持不变。
+
 基线默认保持不变，两个新增模块由独立参数启用，允许比较四种组合。
 
 `--dvs-adjacent-changes`在每个空间位置构建相邻区间证据：

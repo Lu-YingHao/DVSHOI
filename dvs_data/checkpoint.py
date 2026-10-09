@@ -8,7 +8,8 @@ LEGACY_KEYS = {
 QUERY_PREFIX = 'interaction_head.dvs_query.'
 EXTENSION_PREFIXES = tuple(QUERY_PREFIX + name + '.' for name in
                            ('change_norm', 'change_proj', 'token_type', 'interval_proj')) + (
-                               'interaction_head.dvs_relation_query.',)
+                               'interaction_head.dvs_relation_query.',
+                               'interaction_head.dvs_entity_relation.',)
 
 
 def is_legacy_dvs_state(state):
@@ -19,14 +20,19 @@ def query_extension_keys(state):
     return {key for key in state if key.startswith(EXTENSION_PREFIXES)}
 
 
-def validate_query_layout(state, adjacent_changes, precomp_residual, init_query_baseline=False):
+def validate_query_layout(state, adjacent_changes, precomp_residual, init_query_baseline=False,
+                          relation_mode='global'):
     """The optional branches have distinct state keys, including token types."""
     if is_legacy_dvs_state(state):
         if init_query_baseline:
             raise ValueError('--init-query-baseline requires a temporal query checkpoint')
         return  # Legacy initialization is checked separately.
     saved_changes = any(key.startswith(QUERY_PREFIX + 'change_proj.') for key in state)
-    saved_relation = any(key.startswith('interaction_head.dvs_relation_query.') for key in state)
+    global_relation = any(key.startswith('interaction_head.dvs_relation_query.') for key in state)
+    entity_relation = any(key.startswith('interaction_head.dvs_entity_relation.') for key in state)
+    if global_relation and entity_relation:
+        raise ValueError('Checkpoint contains both incompatible DVS relation modes')
+    saved_relation = global_relation or entity_relation
     if init_query_baseline:
         if (saved_changes or saved_relation or not (adjacent_changes or precomp_residual)
                 or not any(key.startswith(QUERY_PREFIX) for key in state)):
@@ -36,6 +42,11 @@ def validate_query_layout(state, adjacent_changes, precomp_residual, init_query_
                          'Match the branch flags, or initialize a NEW experiment with '
                          '--init-query-baseline.'.format(saved_changes, saved_relation,
                                                         adjacent_changes, precomp_residual))
+    elif precomp_residual and entity_relation != (relation_mode == 'entity-slots'):
+        raise ValueError('DVS relation mode mismatch: checkpoint={}, requested={}. '
+                         'Old global checkpoints require --dvs-relation-mode global; '
+                         'entity slots require a NEW training run.'.format(
+                             'entity-slots' if entity_relation else 'global', relation_mode))
 
 
 def load_hoi_weights(model, state, init_legacy_dvs=False, init_query_baseline=False):
@@ -44,8 +55,11 @@ def load_hoi_weights(model, state, init_legacy_dvs=False, init_query_baseline=Fa
     expected = model.state_dict()
     validate_query_layout(
         state, any(key.startswith(QUERY_PREFIX + 'change_proj.') for key in expected),
-        any(key.startswith('interaction_head.dvs_relation_query.') for key in expected),
-        init_query_baseline)
+        any(key.startswith(('interaction_head.dvs_relation_query.',
+                            'interaction_head.dvs_entity_relation.')) for key in expected),
+        init_query_baseline,
+        'entity-slots' if any(key.startswith('interaction_head.dvs_entity_relation.')
+                             for key in expected) else 'global')
     if init_query_baseline:
         new_keys = query_extension_keys(expected)
         missing, unexpected = set(expected) - set(state), set(state) - set(expected)

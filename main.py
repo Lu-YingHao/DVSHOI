@@ -267,6 +267,8 @@ if __name__ == '__main__':
                         help='Append endpoint/signed-change tokens for each adjacent time interval')
     parser.add_argument('--dvs-precomp-residual', action='store_true',
                         help='Inject a zero-initialized pair event residual before competitive reasoning')
+    parser.add_argument('--dvs-relation-mode', default='entity-slots', choices=('global', 'entity-slots'),
+                        help='Entity slots track content per bin without RGB-DVS coordinates; global reproduces old runs')
 
     # training parameters
     parser.add_argument('--device', default='cuda',
@@ -345,7 +347,8 @@ if __name__ == '__main__':
         if os.path.isfile(args.resume):
             checkpoint = torch.load(args.resume, map_location='cpu')
             validate_query_layout(checkpoint['model_state_dict'], args.dvs_adjacent_changes,
-                                  args.dvs_precomp_residual, args.init_query_baseline)
+                                  args.dvs_precomp_residual, args.init_query_baseline,
+                                  args.dvs_relation_mode)
         if args.init_query_baseline:
             print('[CHECK] baseline query initializes shared weights; new experiment starts at epoch 1')
         if args.init_legacy_dvs:
@@ -387,6 +390,8 @@ if __name__ == '__main__':
                 args.dvs_num_bins, args.dvs_query_grid, args.dvs_query_dim))
             print('[CHECK] adjacent changes={}, pre-competitive pair residual={}'.format(
                 args.dvs_adjacent_changes, args.dvs_precomp_residual))
+            if args.dvs_precomp_residual:
+                print('[CHECK] relation mode={}'.format(args.dvs_relation_mode))
         if args.resume_training:
             print('[CHECK] resume epoch {} -> {}; optimizer and scheduler will be restored'.format(
                 start_epoch, args.epochs))

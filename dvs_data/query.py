@@ -39,7 +39,7 @@ class DVSPairActionQuery(nn.Module):
         nn.init.zeros_(self.score.weight)
         nn.init.zeros_(self.score.bias)
 
-    def prepare_memory(self, sequence):
+    def prepare_memory(self, sequence, return_original_content=False):
         """Keep all original bins and optionally (T-1) adjacent intervals."""
         if sequence.ndim != 4 or sequence.shape[0] < 1:
             raise ValueError('Expected DVS sequence [T, C, H, W]')
@@ -55,7 +55,8 @@ class DVSPairActionQuery(nn.Module):
         x = torch.linspace(-1, 1, grid[1], device=sequence.device, dtype=sequence.dtype)
         tt, yy, xx = torch.meshgrid(t, y, x)
         coordinates = torch.stack([tt, yy, xx], dim=-1).reshape(-1, 3)
-        memory = self.event_proj(self.event_norm(tokens)) + self.position_proj(coordinates)
+        original_content = self.event_proj(self.event_norm(tokens))
+        memory = original_content + self.position_proj(coordinates)
         if self.adjacent_changes:
             memory = memory + self.token_type.weight[0]
             if steps > 1:
@@ -70,6 +71,10 @@ class DVSPairActionQuery(nn.Module):
                                  + self.position_proj(change_coordinates)
                                  + self.interval_proj(intervals) + self.token_type.weight[1])
                 memory = torch.cat([memory, change_memory], dim=0)
+        if return_original_content:
+            # Content keys for entity association must not assume that the
+            # RGB object's absolute position equals a DVS grid location.
+            return memory.unsqueeze(1), original_content.reshape(steps, grid[0] * grid[1], -1)
         return memory.unsqueeze(1)
 
     @staticmethod

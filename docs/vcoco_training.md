@@ -20,6 +20,8 @@ Query默认128维、4个注意力头，每个时间段保留最多4×6个空间t
 
 ## 相邻变化token与关系推理前残差实验
 
+2026-10-09更新：`--dvs-precomp-residual`默认使用`--dvs-relation-mode entity-slots`，先读取唯一人物/物体的时序事件主体槽，再组合pair残差。[设计及论文依据](dvs_entity_slots.md)。旧20轮全图关系模型评估或续训时必须另加`--dvs-relation-mode global`。推荐新主体槽实验从头训练，不加载旧HOI权重；保留原预训练DETR。
+
 普通训练入口保持基线结构；`--dvs-adjacent-changes`和`--dvs-precomp-residual`分别启用两个改进。相邻变化追加T−1个区间的空间token，仍保留全部T段原始token；pair关系残差位于competitive layer之前，动作query仍位于之后。两分支共享一次构建的时序memory。
 
 新的单卡实验入口默认从基线第13轮权重初始化，batch=4，学习率`1e-5`，新训练4轮，每轮同步评估并排除point：

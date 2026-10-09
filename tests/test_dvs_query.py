@@ -72,6 +72,17 @@ class TestDVSQuery(unittest.TestCase):
         self.assertGreater(self.model.score.weight.grad.abs().sum().item(), 0)
         self.assertEqual(self.model(self.pairs[:0], self.sequence).shape, (0, 3))
 
+    def test_content_memory_is_shared_projection_without_spatial_position(self):
+        expected = self.model.prepare_memory(self.sequence)
+        memory, content = self.model.prepare_memory(self.sequence, return_original_content=True)
+        torch.testing.assert_allclose(memory, expected, atol=0, rtol=0)
+        self.assertEqual(content.shape, (4, 6, 16))
+        with torch.no_grad():
+            self.model.position_proj.weight.mul_(1000)
+        changed_memory, other_content = self.model.prepare_memory(self.sequence, return_original_content=True)
+        torch.testing.assert_allclose(content, other_content, atol=0, rtol=0)
+        self.assertFalse(torch.allclose(memory, changed_memory))
+
 
 class TestLegacyMigration(unittest.TestCase):
     def setUp(self):

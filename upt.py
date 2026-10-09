@@ -302,6 +302,7 @@ def build_detector(args, class_corr):
         dvs_query_grid=tuple(getattr(args, 'dvs_query_grid', (4, 6))),
         dvs_adjacent_changes=getattr(args, 'dvs_adjacent_changes', False),
         dvs_precomp_residual=getattr(args, 'dvs_precomp_residual', False),
+        dvs_relation_mode=getattr(args, 'dvs_relation_mode', 'entity-slots'),
     )
     detector = UPT(
         detr, postprocessors['bbox'], interaction_head,
