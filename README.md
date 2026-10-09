@@ -1,8 +1,6 @@
 # UPT + DVS
 
-This project extends UPT with a DVS event encoder and pair/action queries over ordered spatiotemporal event tokens for human-object interaction detection. Optional adjacent-change tokens and a pair event residual before competitive reasoning are available as independent experiments; all time bins remain intact. See [the query design](docs/dvs_query_fusion.md) and [training instructions](docs/vcoco_training.md), including explicit checkpoint initialization. The local DETR, HICO-DET, and V-COCO code is included directly to preserve project modifications. Datasets, model checkpoints, and local environments are excluded.
-
-The pre-competitive relation branch now defaults to [temporal entity slots](docs/dvs_entity_slots.md): RGB instance content initializes queries that read event entities in each time bin without mapping RGB boxes to DVS pixels. The design note includes verified paper references, mathematical properties, and validation limits. Use `--dvs-relation-mode global` to reproduce earlier relation checkpoints.
+This project extends UPT with a DVS event encoder and pair/action queries over ordered spatiotemporal event tokens for human-object interaction detection. The temporal-mean DVS fusion has been replaced; see [the query design](docs/dvs_query_fusion.md) and [training instructions](docs/vcoco_training.md), including initialization from legacy checkpoints. The local DETR, HICO-DET, and V-COCO code is included directly to preserve project modifications. Datasets, model checkpoints, and local environments are excluded.
 
 The upstream UPT documentation and attribution follow.
 

@@ -17,7 +17,7 @@ from collections import OrderedDict
 import pocket.pocket as pocket
 
 from ops import compute_spatial_encodings
-from dvs_data import DVSSpikformer, DVSPairActionQuery, DVSPairRelationQuery, DVSTemporalEntityRelation
+from dvs_data import DVSSpikformer, DVSPairActionQuery
 
 class MultiBranchFusion(nn.Module):
     """
@@ -202,9 +202,7 @@ class InteractionHead(nn.Module):
         object_class_to_target_class: List[list],
         use_dvs: bool = False, dvs_variant: str = 'base',
         dvs_query_dim: int = 128, dvs_query_heads: int = 4,
-        dvs_query_chunk_size: int = 16, dvs_query_grid: Tuple[int, int] = (4, 6),
-        dvs_adjacent_changes: bool = False, dvs_precomp_residual: bool = False,
-        dvs_relation_mode: str = 'entity-slots'
+        dvs_query_chunk_size: int = 16, dvs_query_grid: Tuple[int, int] = (4, 6)
     ) -> None:
         super().__init__()
 
@@ -217,10 +215,6 @@ class InteractionHead(nn.Module):
         self.human_idx = human_idx
         self.object_class_to_target_class = object_class_to_target_class
         self.use_dvs = use_dvs
-        self.dvs_precomp_residual = dvs_precomp_residual
-        if dvs_relation_mode not in ('global', 'entity-slots'):
-            raise ValueError('Unknown DVS relation mode')
-        self.dvs_relation_mode = dvs_relation_mode
 
         if self.use_dvs:
             self.dvs_encoder = DVSSpikformer(variant=dvs_variant)
@@ -228,17 +222,7 @@ class InteractionHead(nn.Module):
                 representation_size * 2, self.dvs_encoder.embed_dim, num_classes,
                 query_dim=dvs_query_dim, num_heads=dvs_query_heads,
                 pair_chunk_size=dvs_query_chunk_size, spatial_grid=dvs_query_grid,
-                adjacent_changes=dvs_adjacent_changes,
             )
-            if dvs_precomp_residual:
-                if dvs_relation_mode == 'global':
-                    self.dvs_relation_query = DVSPairRelationQuery(
-                        representation_size * 2, dvs_query_dim, dvs_query_heads,
-                        dvs_query_chunk_size)
-                else:
-                    self.dvs_entity_relation = DVSTemporalEntityRelation(
-                        hidden_state_size, representation_size * 2, dvs_query_dim,
-                        dvs_query_heads, dvs_query_chunk_size)
 
         # Map spatial encodings to the same dimension as appearance features
         self.spatial_head = nn.Sequential(
@@ -350,7 +334,6 @@ class InteractionHead(nn.Module):
                 perm = torch.cat([h_idx, o_idx])
                 boxes = boxes[perm]; scores = scores[perm]
                 labels = labels[perm]; unary_tokens = unary_tokens[perm]
-                is_human = labels == self.human_idx
             # Skip image when there are no valid human-object pairs
             if n_h == 0 or n <= 1:
                 pairwise_tokens_collated.append(torch.zeros(
@@ -398,29 +381,9 @@ class InteractionHead(nn.Module):
                     box_pair_spatial_reshaped[x_keep, y_keep])
             ], dim=1)
             # Run the competitive layer
-            memory = None
-            if self.use_dvs:
-                # Share the original-bin projection. Entity association reads
-                # its content; the action branch also reads position/change tokens.
-                if self.dvs_precomp_residual and self.dvs_relation_mode == 'entity-slots':
-                    memory, temporal_memory = self.dvs_query.prepare_memory(
-                        dvs_features[b_idx], return_original_content=True)
-                else:
-                    memory = self.dvs_query.prepare_memory(dvs_features[b_idx])
-                if self.dvs_precomp_residual:
-                    if self.dvs_relation_mode == 'global':
-                        residual = self.dvs_relation_query(pairwise_tokens, memory)
-                    else:
-                        _, _, height, width = dvs_features[b_idx].shape
-                        grid = self.dvs_query.spatial_grid
-                        spatial_grid = (min(height, grid[0]), min(width, grid[1]))
-                        residual = self.dvs_entity_relation(
-                            pairwise_tokens, unary_tokens, is_human, x_keep, y_keep,
-                            temporal_memory, spatial_grid=spatial_grid)
-                    pairwise_tokens = pairwise_tokens + residual
             pairwise_tokens, pairwise_attn = self.comp_layer(pairwise_tokens)
             if self.use_dvs:
-                dvs_logits_collated.append(self.dvs_query(pairwise_tokens, memory=memory))
+                dvs_logits_collated.append(self.dvs_query(pairwise_tokens, dvs_features[b_idx]))
 
             pairwise_tokens_collated.append(pairwise_tokens)
             boxes_h_collated.append(x_keep)

@@ -18,47 +18,6 @@ CUDA_VISIBLE_DEVICES=0 WORLD_SIZE=1 BATCH_SIZE=4 EPOCHS=12 \
 
 Query默认128维、4个注意力头，每个时间段保留最多4×6个空间token；8个时间段得到192个memory token。这里仅在每个时间段内部压缩空间，不做时间平均。按16个pair分块计算cross-attention，降低临时矩阵的峰值；训练仍需要保存各块的反向传播状态，显存节省主要来自空间token数量的限制。
 
-## 相邻变化token与关系推理前残差实验
-
-2026-10-09更新：`--dvs-precomp-residual`默认使用`--dvs-relation-mode entity-slots`，先读取唯一人物/物体的时序事件主体槽，再组合pair残差。[设计及论文依据](dvs_entity_slots.md)。旧20轮全图关系模型评估或续训时必须另加`--dvs-relation-mode global`。推荐新主体槽实验从头训练，不加载旧HOI权重；保留原预训练DETR。
-
-普通训练入口保持基线结构；`--dvs-adjacent-changes`和`--dvs-precomp-residual`分别启用两个改进。相邻变化追加T−1个区间的空间token，仍保留全部T段原始token；pair关系残差位于competitive layer之前，动作query仍位于之后。两分支共享一次构建的时序memory。
-
-新的单卡实验入口默认从基线第13轮权重初始化，batch=4，学习率`1e-5`，新训练4轮，每轮同步评估并排除point：
-
-```bash
-# 两模块同时启用；先检查资源和checkpoint结构
-bash scripts/train_vcoco_temporal_relation.sh --check-only
-bash scripts/train_vcoco_temporal_relation.sh
-
-# 相同预算的四组实验；分别写入新目录
-ADJACENT_CHANGES=0 PRECOMP_RESIDUAL=0 bash scripts/train_vcoco_temporal_relation.sh
-ADJACENT_CHANGES=1 PRECOMP_RESIDUAL=0 bash scripts/train_vcoco_temporal_relation.sh
-ADJACENT_CHANGES=0 PRECOMP_RESIDUAL=1 bash scripts/train_vcoco_temporal_relation.sh
-ADJACENT_CHANGES=1 PRECOMP_RESIDUAL=1 bash scripts/train_vcoco_temporal_relation.sh
-```
-
-`BASELINE`可指定其他基线query checkpoint，`EPOCHS`、`LR_HEAD`等覆盖实验预算。默认基线是`checkpoints/upt-dvs-vcoco-query-bs4-epochs13-16_20261008_163427/ckpt_16146_13.pt`，Scenario 2为64.9078、Scenario 1为59.4560。checkpoint不会上传GitHub，在其他设备上需自行提供。
-
-上述四组均只加载模型权重，重新建立AdamW和StepLR，从新实验epoch 1开始；不是恢复到旧实验第14轮。启用新模块时脚本显式添加`--init-query-baseline`，只允许新增模块的参数缺失，原RGB层、Spikformer及原动作query权重完整加载。基线对照也重建优化器，保证四组训练预算可比。原学习率`1e-5`在默认4轮期间保持不变，仍沿用第10轮降学习率的调度。
-
-只启用关系残差时，零初始化末层保持基线初始输出；启用相邻变化时已有动作query会读取额外token，初始预测可能改变，需要单独记录训练前性能及训练后的结果。
-
-评估或恢复**新结构自身**的checkpoint时，必须传入训练时相同的两个分支开关，并去掉`--init-query-baseline`：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 WORLD_SIZE=1 BATCH_SIZE=4 \
-  bash scripts/train_vcoco_dvs.sh --eval \
-  --resume checkpoints/<新实验>/ckpt_<iteration>_04.pt \
-  --dvs-adjacent-changes --dvs-precomp-residual
-
-RESUME=checkpoints/<新实验>/ckpt_<iteration>_04.pt FINAL_EPOCH=8 \
-  bash scripts/resume_vcoco_dvs_4epochs.sh \
-  --dvs-adjacent-changes --dvs-precomp-residual
-```
-
-分支开关与保存权重不匹配会报错。旧基线直接评估及续训不添加这两个开关即可，历史脚本仍运行原基线。基线迁移到新结构不允许`--resume-training`，因为新增参数改变了优化器参数集合。
-
 ## 旧均值模型的权重
 
 旧均值模型的结构、优化器参数集合和新query模型不同，不能使用 `--resume-training`继续旧实验，也不能用新代码直接评估旧模型。

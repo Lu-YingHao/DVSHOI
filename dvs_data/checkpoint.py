@@ -1,4 +1,4 @@
-"""Strict DVS weight loading and explicit initialization of new query branches."""
+"""Explicit weight migration from the retired global-mean DVS branch."""
 
 
 LEGACY_KEYS = {
@@ -6,68 +6,13 @@ LEGACY_KEYS = {
     'interaction_head.dvs_adapter.weight', 'interaction_head.dvs_adapter.bias',
 }
 QUERY_PREFIX = 'interaction_head.dvs_query.'
-EXTENSION_PREFIXES = tuple(QUERY_PREFIX + name + '.' for name in
-                           ('change_norm', 'change_proj', 'token_type', 'interval_proj')) + (
-                               'interaction_head.dvs_relation_query.',
-                               'interaction_head.dvs_entity_relation.',)
 
 
 def is_legacy_dvs_state(state):
     return bool(LEGACY_KEYS.intersection(state))
 
 
-def query_extension_keys(state):
-    return {key for key in state if key.startswith(EXTENSION_PREFIXES)}
-
-
-def validate_query_layout(state, adjacent_changes, precomp_residual, init_query_baseline=False,
-                          relation_mode='global'):
-    """The optional branches have distinct state keys, including token types."""
-    if is_legacy_dvs_state(state):
-        if init_query_baseline:
-            raise ValueError('--init-query-baseline requires a temporal query checkpoint')
-        return  # Legacy initialization is checked separately.
-    saved_changes = any(key.startswith(QUERY_PREFIX + 'change_proj.') for key in state)
-    global_relation = any(key.startswith('interaction_head.dvs_relation_query.') for key in state)
-    entity_relation = any(key.startswith('interaction_head.dvs_entity_relation.') for key in state)
-    if global_relation and entity_relation:
-        raise ValueError('Checkpoint contains both incompatible DVS relation modes')
-    saved_relation = global_relation or entity_relation
-    if init_query_baseline:
-        if (saved_changes or saved_relation or not (adjacent_changes or precomp_residual)
-                or not any(key.startswith(QUERY_PREFIX) for key in state)):
-            raise ValueError('--init-query-baseline needs a baseline query checkpoint and a new DVS branch')
-    elif (saved_changes, saved_relation) != (adjacent_changes, precomp_residual):
-        raise ValueError('DVS checkpoint branch mismatch: saved changes/relation={}/{}, requested={}/{}. '
-                         'Match the branch flags, or initialize a NEW experiment with '
-                         '--init-query-baseline.'.format(saved_changes, saved_relation,
-                                                        adjacent_changes, precomp_residual))
-    elif precomp_residual and entity_relation != (relation_mode == 'entity-slots'):
-        raise ValueError('DVS relation mode mismatch: checkpoint={}, requested={}. '
-                         'Old global checkpoints require --dvs-relation-mode global; '
-                         'entity slots require a NEW training run.'.format(
-                             'entity-slots' if entity_relation else 'global', relation_mode))
-
-
-def load_hoi_weights(model, state, init_legacy_dvs=False, init_query_baseline=False):
-    if init_legacy_dvs and init_query_baseline:
-        raise ValueError('Choose only one checkpoint initialization mode')
-    expected = model.state_dict()
-    validate_query_layout(
-        state, any(key.startswith(QUERY_PREFIX + 'change_proj.') for key in expected),
-        any(key.startswith(('interaction_head.dvs_relation_query.',
-                            'interaction_head.dvs_entity_relation.')) for key in expected),
-        init_query_baseline,
-        'entity-slots' if any(key.startswith('interaction_head.dvs_entity_relation.')
-                             for key in expected) else 'global')
-    if init_query_baseline:
-        new_keys = query_extension_keys(expected)
-        missing, unexpected = set(expected) - set(state), set(state) - set(expected)
-        if missing != new_keys or unexpected:
-            raise ValueError('Query baseline has incompatible shared layers: missing={} unexpected={}'.format(
-                sorted(missing - new_keys), sorted(unexpected)))
-        model.load_state_dict(state, strict=False)
-        return sorted(new_keys)
+def load_hoi_weights(model, state, init_legacy_dvs=False):
     if not is_legacy_dvs_state(state):
         if init_legacy_dvs:
             raise ValueError('--init-legacy-dvs requires a legacy mean/residual checkpoint')
@@ -78,7 +23,8 @@ def load_hoi_weights(model, state, init_legacy_dvs=False, init_query_baseline=Fa
             'This checkpoint uses the retired temporal-mean DVS branch. '
             'For a new query experiment use --resume PATH --init-legacy-dvs; '
             'do not use --resume-training or --eval with legacy DVS weights.')
-    new_keys = {key for key in expected if key.startswith(QUERY_PREFIX)} | query_extension_keys(expected)
+    expected = model.state_dict()
+    new_keys = {key for key in expected if key.startswith(QUERY_PREFIX)}
     if not new_keys:
         raise ValueError('Legacy DVS initialization requires --use-dvs with the query model')
     shared = {key: value for key, value in state.items() if key not in LEGACY_KEYS}
